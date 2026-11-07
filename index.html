@@ -131,14 +131,14 @@ input[type=file] { font: 400 13px var(--f-body); color: var(--muted); max-width:
 <div class="wrap">
   <header>
     <h1>EPUB 編輯工坊</h1>
-    <p class="lede">簡體轉繁體、標點轉換、直排橫排、字型與行距、封面更換。檔案只在這個分頁裡處理，不會上傳到任何伺服器。</p>
+    <p class="lede">簡體轉繁體、標點轉換、直排橫排、字型與行距、封面更換，也能把 MOBI、AZW、AZW3 轉成 EPUB。檔案只在這個分頁裡處理，不會上傳到任何伺服器。</p>
   </header>
 
   <div class="grid">
     <aside class="bench">
-      <input type="file" id="fileInput" accept=".epub,application/epub+zip" hidden>
-      <div class="slot" id="slot" role="button" tabindex="0" aria-label="選擇或拖放 EPUB 檔案">
-        <div class="hint" id="slotHint"><b>拖放 EPUB 到這裡</b><span>或點擊選擇檔案</span><span>建議 50MB 以下，手機建議 20MB 以下</span></div>
+      <input type="file" id="fileInput" accept=".epub,.mobi,.azw,.azw3,.prc,application/epub+zip" hidden>
+      <div class="slot" id="slot" role="button" tabindex="0" aria-label="選擇或拖放 EPUB、MOBI、AZW 檔案">
+        <div class="hint" id="slotHint"><b>拖放 EPUB、MOBI 或 AZW 到這裡</b><span>或點擊選擇檔案</span><span>建議 50MB 以下，手機建議 20MB 以下</span></div>
         <img id="coverImg" alt="目前封面" hidden>
         <div class="nocover" id="noCover" hidden>這本書沒有封面</div>
       </div>
@@ -154,8 +154,9 @@ input[type=file] { font: 400 13px var(--f-body); color: var(--muted); max-width:
       <div class="result">
         <button class="btn" id="goBtn" disabled>輸出 EPUB</button>
         <progress id="prog" value="0" max="1" hidden></progress>
-        <p class="status" id="status" role="status" aria-live="polite">先選擇一個 EPUB 檔案。</p>
+        <p class="status" id="status" role="status" aria-live="polite">先選擇一個 EPUB、MOBI 或 AZW 檔案。</p>
         <button class="btn ghost" id="saveBtn" hidden>儲存 EPUB</button>
+        <button class="btn ghost" id="rawBtn" hidden>只轉成 EPUB，不做其他調整</button>
       </div>
     </aside>
 
@@ -266,6 +267,8 @@ input[type=file] { font: 400 13px var(--f-body); color: var(--muted); max-width:
   var newCover = null;
   var coverUrl = null;
   var resultBlob = null;
+  var convertedBlob = null;
+  var convertedName = '';
   var outName = 'edited.epub';
 
   var FONTS = {
@@ -275,6 +278,593 @@ input[type=file] { font: 400 13px var(--f-body); color: var(--muted); max-width:
   };
   var DC = 'http://purl.org/dc/elements/1.1/';
   var NF = { createFolders: false };
+
+  /* ===== MOBI / AZW / AZW3 轉 EPUB（不使用 DOM，可在 Node 測試） ===== */
+  function MobiConverter(JSZipLib) {
+    var UTF8 = new TextDecoder('utf-8');
+    function fail(msg) { var e = new Error(msg); e.friendly = true; return e; }
+    function u16(d, o) { return (d[o] << 8) | d[o + 1]; }
+    function u32(d, o) { return ((d[o] << 24) | (d[o + 1] << 16) | (d[o + 2] << 8) | d[o + 3]) >>> 0; }
+    function ascii(d, s, e) { var r = ''; for (var i = s; i < e && i < d.length; i++) r += String.fromCharCode(d[i]); return r; }
+    function latin1(u8) {
+      var out = [], CH = 8192;
+      for (var i = 0; i < u8.length; i += CH) out.push(String.fromCharCode.apply(null, u8.subarray(i, i + CH)));
+      return out.join('');
+    }
+    function fromLatin1(s) { var b = new Uint8Array(s.length); for (var i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 255; return b; }
+    function decodeWith(enc, bytes) {
+      try { return (enc === 1252 ? new TextDecoder('windows-1252') : UTF8).decode(bytes); }
+      catch (e) { return latin1(bytes); }
+    }
+    function xmlEsc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function cleanXml(s) { return s.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f￾￿]/g, ''); }
+    function pad(n) { var s = String(n); while (s.length < 4) s = '0' + s; return s; }
+    function imgPath(idx, ext) { return 'images/img' + pad(idx + 1) + '.' + ext; }
+
+    /* ---------- PalmDB 與 MOBI 標頭 ---------- */
+    function parsePdb(u8) {
+      if (u8.length < 100) throw fail('檔案太小，不是有效的 MOBI／AZW 檔案。');
+      if (ascii(u8, 0, 4) === 'TPZ0') throw fail('這是舊式 Topaz 格式（AZW1），無法轉換。');
+      var sig = ascii(u8, 60, 68);
+      if (sig !== 'BOOKMOBI') throw fail('這不是 MOBI／AZW 格式的書（檔頭不符）。');
+      var n = u16(u8, 76), offs = [];
+      for (var i = 0; i < n; i++) offs.push(u32(u8, 78 + i * 8));
+      return {
+        n: n,
+        rec: function (i) {
+          var s = offs[i], e = i + 1 < n ? offs[i + 1] : u8.length;
+          return u8.subarray(s, Math.max(s, e));
+        }
+      };
+    }
+    function parseHeader(r0) {
+      var h = {};
+      h.compression = u16(r0, 0);
+      h.textRecords = u16(r0, 8);
+      h.encryption = u16(r0, 12);
+      if (ascii(r0, 16, 20) !== 'MOBI') throw fail('這個檔案沒有 MOBI 標頭（可能是舊式 PalmDOC），無法轉換。');
+      h.hlen = u32(r0, 20);
+      h.encoding = u32(r0, 28);
+      h.version = u32(r0, 36);
+      h.nameOff = u32(r0, 84);
+      h.nameLen = u32(r0, 88);
+      h.firstImage = u32(r0, 108);
+      h.exthFlags = u32(r0, 128);
+      h.extraFlags = (h.hlen >= 228 && r0.length >= 0xf4) ? u16(r0, 0xf2) : 0;
+      h.fdst = r0.length >= 0xc4 ? u32(r0, 0xc0) : 0xffffffff;
+      h.frag = (h.hlen >= 240 && r0.length >= 0x100) ? u32(r0, 0xf8) : 0xffffffff;
+      h.skel = (h.hlen >= 240 && r0.length >= 0x100) ? u32(r0, 0xfc) : 0xffffffff;
+      return h;
+    }
+    function parseExth(r0, h) {
+      var meta = { cover: null, authors: [], publisher: '', description: '', subjects: [], lang: '', title: '' };
+      if (!(h.exthFlags & 0x40)) return meta;
+      var p = 16 + h.hlen;
+      if (ascii(r0, p, p + 4) !== 'EXTH') return meta;
+      var count = u32(r0, p + 8);
+      p += 12;
+      for (var i = 0; i < count && p + 8 <= r0.length; i++) {
+        var t = u32(r0, p), len = u32(r0, p + 4);
+        if (len < 8) break;
+        var d = r0.subarray(p + 8, p + len);
+        if (t === 100) meta.authors.push(decodeWith(h.encoding, d));
+        else if (t === 101) meta.publisher = decodeWith(h.encoding, d);
+        else if (t === 103) meta.description = decodeWith(h.encoding, d);
+        else if (t === 105) meta.subjects.push(decodeWith(h.encoding, d));
+        else if (t === 503) meta.title = decodeWith(h.encoding, d);
+        else if (t === 524) meta.lang = decodeWith(h.encoding, d);
+        else if (t === 201 && d.length >= 4) meta.cover = u32(d, 0);
+        p += len;
+      }
+      return meta;
+    }
+
+    /* ---------- 文字解壓縮 ---------- */
+    function backVar(rec, psize) {
+      var bitpos = 0, result = 0;
+      for (;;) {
+        var v = rec[psize - 1];
+        result |= (v & 0x7f) << bitpos;
+        bitpos += 7;
+        psize--;
+        if ((v & 0x80) || bitpos >= 28 || psize === 0) return result;
+      }
+    }
+    function trailSize(rec, flags) {
+      var num = 0, f = flags >> 1;
+      while (f) {
+        if (f & 1) num += backVar(rec, rec.length - num);
+        f >>= 1;
+      }
+      if (flags & 1) num += (rec[rec.length - num - 1] & 3) + 1;
+      return num;
+    }
+    function palmDecompress(inp) {
+      var out = new Uint8Array(inp.length * 4 + 4096), o = 0, i = 0, n = inp.length;
+      function ensure(k) {
+        if (o + k > out.length) {
+          var b = new Uint8Array(Math.max(out.length * 2, o + k));
+          b.set(out.subarray(0, o));
+          out = b;
+        }
+      }
+      while (i < n) {
+        var c = inp[i++];
+        if (c === 0) { ensure(1); out[o++] = 0; }
+        else if (c <= 8) { ensure(c); for (var k = 0; k < c && i < n; k++) out[o++] = inp[i++]; }
+        else if (c <= 0x7f) { ensure(1); out[o++] = c; }
+        else if (c <= 0xbf) {
+          var c2 = inp[i++], v = (c << 8) | c2, dist = (v >> 3) & 0x7ff, len = (c2 & 7) + 3;
+          if (!dist) continue;
+          ensure(len);
+          for (var k2 = 0; k2 < len; k2++) { out[o] = out[o - dist]; o++; }
+        } else { ensure(2); out[o++] = 32; out[o++] = c ^ 0x80; }
+      }
+      return out.subarray(0, o);
+    }
+    function readText(pdb, h) {
+      var parts = [], total = 0;
+      for (var i = 1; i <= h.textRecords && i < pdb.n; i++) {
+        var rec = pdb.rec(i);
+        var end = rec.length - trailSize(rec, h.extraFlags);
+        var data = rec.subarray(0, Math.max(0, end));
+        var out = h.compression === 2 ? palmDecompress(data) : data;
+        parts.push(out);
+        total += out.length;
+      }
+      var text = new Uint8Array(total), o = 0;
+      parts.forEach(function (p) { text.set(p, o); o += p.length; });
+      return text;
+    }
+
+    /* ---------- 圖片 ---------- */
+    function sniff(r) {
+      if (r.length < 8) return null;
+      if (r[0] === 0xff && r[1] === 0xd8) return { mime: 'image/jpeg', ext: 'jpg', bytes: r };
+      if (r[0] === 0x89 && r[1] === 0x50 && r[2] === 0x4e && r[3] === 0x47) return { mime: 'image/png', ext: 'png', bytes: r };
+      if (r[0] === 0x47 && r[1] === 0x49 && r[2] === 0x46 && r[3] === 0x38) return { mime: 'image/gif', ext: 'gif', bytes: r };
+      return null;
+    }
+    function collectImages(pdb, first) {
+      var imgs = {};
+      if (!first || first === 0xffffffff) return imgs;
+      for (var i = first; i < pdb.n; i++) {
+        var k = sniff(pdb.rec(i));
+        if (k) imgs[i - first] = k;
+      }
+      return imgs;
+    }
+
+    /* ---------- MOBI 內容轉 XHTML ---------- */
+    var NAMED = { nbsp: '#160', copy: '#169', reg: '#174', hellip: '#8230', mdash: '#8212', ndash: '#8211', lsquo: '#8216', rsquo: '#8217', ldquo: '#8220', rdquo: '#8221', laquo: '#171', raquo: '#187', middot: '#183', bull: '#8226', trade: '#8482', times: '#215', divide: '#247', deg: '#176', amp: 'amp', lt: 'lt', gt: 'gt', quot: 'quot', apos: 'apos' };
+    NAMED.hellip = '#8230';
+    function fixAmp(t) {
+      t = t.replace(/&([A-Za-z][A-Za-z0-9]*);/g, function (m, n) {
+        var v = NAMED[n];
+        return v ? '&' + v + ';' : '&amp;' + n + ';';
+      });
+      return t.replace(/&(?!(?:amp|lt|gt|quot|apos|#\d+|#[xX][0-9a-fA-F]+);)/g, '&amp;');
+    }
+    function escAttr(v) { return fixAmp(v).replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
+    var VOID = { br: 1, hr: 1, img: 1 };
+    var KEEP = { p: 1, div: 1, span: 1, h1: 1, h2: 1, h3: 1, h4: 1, h5: 1, h6: 1, b: 1, i: 1, u: 1, em: 1, strong: 1, small: 1, big: 1, sub: 1, sup: 1, s: 1, strike: 1, blockquote: 1, ul: 1, ol: 1, li: 1, dl: 1, dt: 1, dd: 1, table: 1, thead: 1, tbody: 1, tfoot: 1, tr: 1, td: 1, th: 1, caption: 1, pre: 1, code: 1, tt: 1, a: 1, br: 1, hr: 1, img: 1, center: 1, cite: 1, q: 1, abbr: 1 };
+    var BLOCK = { div: 1, h1: 1, h2: 1, h3: 1, h4: 1, h5: 1, h6: 1, ul: 1, ol: 1, table: 1, blockquote: 1, pre: 1, hr: 1, dl: 1 };
+    var TAG_RE = /<!--[\s\S]*?-->|<(\/?)([A-Za-z][A-Za-z0-9:_-]*)((?:[^>"']|"[^"]*"|'[^']*')*)>|<[!?][^>]*>|[^<]+|</g;
+    var ATTR_RE = /([^\s=\/"'<>]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/g;
+
+    function toXhtml(src, ctx) {
+      src = src.replace(/<head[\s>][\s\S]*?<\/head>/i, '');
+      var bi = src.search(/<body[\s>]/i);
+      if (bi >= 0) { var be = src.indexOf('>', bi); src = src.substring(be + 1); }
+      src = src.replace(/<\/body>|<\/html>/gi, '');
+      var out = [], stack = [], m;
+      function top() { return stack.length ? stack[stack.length - 1] : null; }
+      function closeTop() { var t = stack.pop(); out.push('</' + t.out + '>'); }
+      TAG_RE.lastIndex = 0;
+      while ((m = TAG_RE.exec(src))) {
+        var tok = m[0];
+        if (tok.charCodeAt(0) !== 60) { out.push(fixAmp(tok)); continue; }
+        if (tok === '<') { out.push('&lt;'); continue; }
+        if (tok.charAt(1) === '!' || tok.charAt(1) === '?') continue;
+        var closing = !!m[1], name = m[2].toLowerCase();
+        if (name.indexOf(':') >= 0 || !KEEP[name]) continue;
+        if (closing) {
+          if (VOID[name]) continue;
+          for (var si = stack.length - 1; si >= 0; si--) {
+            if (stack[si].src === name) { while (stack.length > si) closeTop(); break; }
+          }
+          continue;
+        }
+        var a = {};
+        m[3].replace(ATTR_RE, function (_, k, v1, v2, v3) {
+          a[k.toLowerCase()] = v1 !== undefined ? v1 : (v2 !== undefined ? v2 : (v3 !== undefined ? v3 : ''));
+          return '';
+        });
+        var t = top();
+        if (name === 'p' || BLOCK[name]) { while ((t = top()) && t.src === 'p') closeTop(); }
+        if (name === 'li') { if ((t = top()) && t.src === 'li') closeTop(); }
+        if (name === 'dt' || name === 'dd') { if ((t = top()) && (t.src === 'dt' || t.src === 'dd')) closeTop(); }
+        if (name === 'tr') { while ((t = top()) && (t.src === 'td' || t.src === 'th' || t.src === 'tr')) closeTop(); }
+        if (name === 'td' || name === 'th') { if ((t = top()) && (t.src === 'td' || t.src === 'th')) closeTop(); }
+        var style = '';
+        if (a.align && /^(center|right|left|justify)$/i.test(a.align) && (name === 'p' || name === 'div' || /^h[1-6]$/.test(name))) style = 'text-align:' + a.align.toLowerCase();
+        var id = a.id || a.name || '';
+        if (name === 'img') {
+          var ri = parseInt(a.recindex || a.hirecindex || a.lorecindex || '0', 10), path = ri ? ctx.img(ri) : null;
+          if (path) out.push('<img src="' + path + '" alt="' + escAttr(a.alt || '') + '"/>');
+          continue;
+        }
+        if (name === 'br') { out.push('<br/>'); continue; }
+        if (name === 'hr') { out.push('<hr/>'); continue; }
+        if (name === 'a') {
+          var href = '';
+          if (a.filepos) href = ctx.fp(parseInt(a.filepos, 10));
+          else if (a.href && /^(https?:|mailto:|#)/i.test(a.href)) href = a.href;
+          if (!href && !id) continue;
+          if ((t = top()) && t.src === 'a') closeTop();
+          out.push('<a' + (id ? ' id="' + escAttr(id) + '"' : '') + (href ? ' href="' + escAttr(href) + '"' : '') + '>');
+          stack.push({ src: 'a', out: 'a' });
+          continue;
+        }
+        var outName = name === 'center' ? 'div' : (name === 'tt' ? 'code' : name);
+        if (name === 'center') style = 'text-align:center';
+        var attrs = '';
+        if (id) attrs += ' id="' + escAttr(id) + '"';
+        if (name === 'td' || name === 'th') {
+          if (/^\d+$/.test(a.colspan || '')) attrs += ' colspan="' + a.colspan + '"';
+          if (/^\d+$/.test(a.rowspan || '')) attrs += ' rowspan="' + a.rowspan + '"';
+        }
+        if (style) attrs += ' style="' + style + '"';
+        out.push('<' + outName + attrs + '>');
+        stack.push({ src: name, out: outName });
+      }
+      while (stack.length) closeTop();
+      return out.join('');
+    }
+    function hasContent(str) {
+      return /<img\b/i.test(str) || str.replace(/<[^>]*>/g, '').replace(/&nbsp;|\s/g, '').length > 0;
+    }
+
+    function mobi6(h, text, imgs) {
+      var s = latin1(text), ranges = [], re = /<mbp:pagebreak[^>]*>/gi, last = 0, m;
+      while ((m = re.exec(s))) { ranges.push([last, m.index]); last = m.index + m[0].length; }
+      ranges.push([last, s.length]);
+      ranges = ranges.filter(function (r) { return hasContent(s.substring(r[0], r[1])); });
+      if (ranges.length === 1 && ranges[0][1] - ranges[0][0] > 120000) {
+        var r0 = ranges[0], starts = [r0[0]], hre = /<h[12][\s>]/gi;
+        while ((m = hre.exec(s))) { if (m.index > r0[0] && m.index < r0[1]) starts.push(m.index); }
+        if (starts.length > 1) {
+          ranges = starts.map(function (st, i) { return [st, i + 1 < starts.length ? starts[i + 1] : r0[1]]; })
+            .filter(function (r) { return hasContent(s.substring(r[0], r[1])); });
+        }
+      }
+      var SPLIT = 150000;
+      var sized = [];
+      ranges.forEach(function (r) {
+        if (r[1] - r[0] <= SPLIT * 2) { sized.push(r); return; }
+        var st = r[0];
+        while (r[1] - st > SPLIT * 2) {
+          var cut = s.indexOf('</p>', st + SPLIT);
+          if (cut < 0 || cut >= r[1]) break;
+          cut += 4;
+          sized.push([st, cut]);
+          st = cut;
+        }
+        sized.push([st, r[1]]);
+      });
+      ranges = sized;
+      if (!ranges.length) throw fail('這個檔案裡找不到內容。');
+
+      function chunkOf(pos) {
+        var lo = 0, hi = ranges.length - 1;
+        while (lo < hi) {
+          var mid = (lo + hi + 1) >> 1;
+          if (ranges[mid][0] <= pos) lo = mid; else hi = mid - 1;
+        }
+        if (pos >= ranges[lo][1] && lo + 1 < ranges.length) lo++;
+        return lo;
+      }
+      var targets = {}, fre = /filepos\s*=\s*["']?(\d+)/gi;
+      while ((m = fre.exec(s))) targets[parseInt(m[1], 10)] = true;
+      var chunkTargets = ranges.map(function () { return []; });
+      Object.keys(targets).forEach(function (k) { chunkTargets[chunkOf(+k)].push(+k); });
+      var ctx = {
+        img: function (ri) { var k = imgs[ri - 1]; return k ? imgPath(ri - 1, k.ext) : null; },
+        fp: function (pos) { return 'part' + pad(chunkOf(pos) + 1) + '.xhtml#fp' + pos; }
+      };
+      var parts = ranges.map(function (r, ci) {
+        var a = r[0], c = s.substring(a, r[1]), ps = chunkTargets[ci].sort(function (x, y) { return x - y; });
+        var out = '', prev = 0;
+        ps.forEach(function (pos) {
+          var rel = Math.min(Math.max(pos - a, 0), c.length);
+          var lt = c.lastIndexOf('<', rel - 1), gt = c.lastIndexOf('>', rel - 1);
+          if (lt > gt) rel = lt;
+          if (rel < prev) rel = prev;
+          out += c.substring(prev, rel) + '<a id="fp' + pos + '"></a>';
+          prev = rel;
+        });
+        out += c.substring(prev);
+        var body = cleanXml(decodeWith(h.encoding, fromLatin1(toXhtml(out, ctx))));
+        return { body: body };
+      });
+      return { parts: parts, css: [{ path: 'css/style.css', data: 'body { margin: 0 .5em; line-height: 1.6; }\np { margin: 0 0 .6em 0; }\nh1, h2, h3 { margin: 1em 0 .6em 0; }\nimg { max-width: 100%; }\n' }], files: [], mobi6: true };
+    }
+
+    /* ---------- KF8（AZW3）索引與重組 ---------- */
+    function varint(d, p) {
+      var v = 0, n = 0, b;
+      do { b = d[p + n]; v = v * 128 + (b & 0x7f); n++; } while (!(b & 0x80) && p + n < d.length);
+      return [v, n];
+    }
+    function popcnt(x) { var c = 0; while (x) { c += x & 1; x >>= 1; } return c; }
+    function readTagx(r, p) {
+      if (ascii(r, p, p + 4) !== 'TAGX') throw fail('KF8 索引格式不符。');
+      var first = u32(r, p + 4), cc = u32(r, p + 8), tags = [];
+      for (var i = 12; i < first; i += 4) tags.push({ tag: r[p + i], vpe: r[p + i + 1], mask: r[p + i + 2], end: r[p + i + 3] });
+      return { cc: cc, tags: tags };
+    }
+    function entryTags(d, start, end, tg) {
+      var present = [], ci = 0, pos = start + tg.cc;
+      tg.tags.forEach(function (t) {
+        if (t.end & 1) { ci++; return; }
+        var val = d[start + ci] & t.mask;
+        if (!val) return;
+        if (val === t.mask) {
+          if (popcnt(t.mask) > 1) { var vn = varint(d, pos); pos += vn[1]; present.push({ t: t, bytes: vn[0] }); }
+          else present.push({ t: t, count: 1 });
+        } else {
+          var mk = t.mask, v = val;
+          while (!(mk & 1)) { mk >>= 1; v >>= 1; }
+          present.push({ t: t, count: v });
+        }
+      });
+      var res = {};
+      present.forEach(function (p) {
+        var vals = [], q;
+        if (p.count !== undefined) {
+          for (var i = 0; i < p.count * p.t.vpe; i++) { q = varint(d, pos); pos += q[1]; vals.push(q[0]); }
+        } else {
+          var used = 0;
+          while (used < p.bytes && pos < end) { q = varint(d, pos); pos += q[1]; used += q[1]; vals.push(q[0]); }
+        }
+        res[p.t.tag] = vals;
+      });
+      return res;
+    }
+    function readIndex(pdb, idx) {
+      var r = pdb.rec(idx);
+      if (ascii(r, 0, 4) !== 'INDX') throw fail('KF8 索引讀取失敗。');
+      var hlen = u32(r, 4), cnt = u32(r, 24), tg = readTagx(r, hlen), out = [];
+      for (var i = idx + 1; i <= idx + cnt && i < pdb.n; i++) {
+        var d = pdb.rec(i);
+        if (ascii(d, 0, 4) !== 'INDX') continue;
+        var idxt = u32(d, 20), n = u32(d, 24), pos = [], j;
+        for (j = 0; j < n; j++) pos.push(u16(d, idxt + 4 + 2 * j));
+        pos.push(idxt);
+        for (j = 0; j < n; j++) {
+          var s = pos[j], e = pos[j + 1], tl = d[s];
+          out.push({ label: ascii(d, s + 1, s + 1 + tl), tags: entryTags(d, s + 1 + tl, e, tg) });
+        }
+      }
+      return out;
+    }
+    function idAt(str, off) {
+      if (off < 0 || off >= str.length) return null;
+      var ts = str.charAt(off) === '<' ? off : str.lastIndexOf('<', off);
+      if (ts < 0) return null;
+      var te = str.indexOf('>', ts);
+      if (te < 0) return null;
+      var tag = str.substring(ts, te + 1);
+      if (!/^<[A-Za-z]/.test(tag)) return null;
+      var m = tag.match(/\sid=["']([^"']+)["']/);
+      if (m) return { id: m[1] };
+      m = tag.match(/\said=["']([^"']+)["']/);
+      return m ? { aid: m[1] } : null;
+    }
+    function fixAid(str, needed) {
+      return str.replace(/<[A-Za-z][^<>]*>/g, function (tag) {
+        var am = tag.match(/\said=(["'])([^"']*)\1/);
+        if (!am) return tag;
+        var hasId = /\sid=["']/.test(tag), out = tag.replace(am[0], '');
+        if (!hasId && needed[am[2]]) out = out.replace(/^<([A-Za-z0-9:_-]+)/, '<$1 id="aid-' + am[2] + '"');
+        return out;
+      });
+    }
+
+    function kf8(pdb, h, text, imgs) {
+      var NONE = 0xffffffff;
+      if (h.skel === NONE || h.frag === NONE || !h.skel || !h.frag) throw fail('這個 KF8 檔案缺少章節索引，無法轉換。');
+      var skels = readIndex(pdb, h.skel), frags = readIndex(pdb, h.frag);
+      if (!skels.length) throw fail('KF8 章節索引是空的。');
+
+      var flows = [text];
+      if (h.fdst !== NONE && h.fdst > 0 && h.fdst < pdb.n) {
+        var fr = pdb.rec(h.fdst);
+        if (ascii(fr, 0, 4) === 'FDST') {
+          var st = u32(fr, 4), cnt = u32(fr, 8);
+          flows = [];
+          for (var i = 0; i < cnt; i++) flows.push(text.subarray(u32(fr, st + 8 * i), u32(fr, st + 8 * i + 4)));
+        }
+      }
+
+      var raw = [], fragLoc = [], fp = 0;
+      skels.forEach(function (sk, si) {
+        var cnt = (sk.tags[1] || [0])[0], g = sk.tags[6] || [0, 0];
+        var base = g[0] + g[1], str = latin1(text.subarray(g[0], base));
+        for (var j = 0; j < cnt && fp < frags.length; j++, fp++) {
+          var fg = frags[fp], flen = (fg.tags[6] || [0, 0])[1];
+          var slice = latin1(text.subarray(base, base + flen));
+          var ins = Math.max(0, Math.min(parseInt(fg.label, 10) - g[0], str.length));
+          var head = str.substring(0, ins);
+          if (head.lastIndexOf('>') < head.lastIndexOf('<')) {
+            var gt = str.indexOf('>', ins);
+            if (gt >= 0) ins = gt + 1;
+          }
+          str = str.substring(0, ins) + slice + str.substring(ins);
+          fragLoc[fp] = { part: si, off: ins };
+          base += flen;
+        }
+        raw.push(str);
+      });
+
+      var needAid = raw.map(function () { return {}; }), posCache = {};
+      function resolvePos(fid, off) {
+        var key = fid + ':' + off;
+        if (posCache[key] !== undefined) return posCache[key];
+        var loc = fragLoc[fid], res = null;
+        if (loc) {
+          res = { part: loc.part, id: null };
+          var info = idAt(raw[loc.part], loc.off + off);
+          if (info) {
+            if (info.id) res.id = info.id;
+            else if (info.aid) { res.id = 'aid-' + info.aid; needAid[loc.part][info.aid] = true; }
+          }
+        }
+        posCache[key] = res;
+        return res;
+      }
+      var POS_RE = /kindle:pos:fid:([0-9A-Za-z]+):off:([0-9A-Za-z]+)/g;
+      raw.forEach(function (str) {
+        var m;
+        POS_RE.lastIndex = 0;
+        while ((m = POS_RE.exec(str))) resolvePos(parseInt(m[1], 32), parseInt(m[2], 32));
+      });
+
+      var flowFiles = [];
+      function flowPath(fi) {
+        var b = flows[fi];
+        if (!b) return '';
+        var isSvg = /^\s*(<\?xml[^>]*\?>\s*)?<svg/i.test(latin1(b.subarray(0, 200)));
+        return (isSvg ? 'images/flow' : 'css/flow') + pad(fi) + (isSvg ? '.svg' : '.css');
+      }
+      function embed(c) {
+        var idx = parseInt(c, 32) - 1, k = imgs[idx];
+        return k ? imgPath(idx, k.ext) : '';
+      }
+      function rel(p, dir) {
+        if (!p || !dir) return p;
+        return p.indexOf(dir + '/') === 0 ? p.substring(dir.length + 1) : '../' + p;
+      }
+      function relink(str, dir) {
+        return str
+          .replace(POS_RE, function (_, f, o) {
+            var r = resolvePos(parseInt(f, 32), parseInt(o, 32));
+            return r ? 'part' + pad(r.part + 1) + '.xhtml' + (r.id ? '#' + r.id : '') : '#';
+          })
+          .replace(/kindle:embed:([0-9A-Za-z]+)(?:\?mime=[^"')\s<>]*)?/g, function (_, c) { return rel(embed(c), dir); })
+          .replace(/kindle:flow:([0-9A-Za-z]+)(?:\?mime=[^"')\s<>]*)?/g, function (_, c) { return rel(flowPath(parseInt(c, 32)), dir); });
+      }
+
+      var parts = raw.map(function (str, si) {
+        str = relink(fixAid(str, needAid[si]));
+        var doc = cleanXml(decodeWith(65001, fromLatin1(str)));
+        if (!/^\s*<\?xml/.test(doc)) doc = '<?xml version="1.0" encoding="UTF-8"?>\n' + doc;
+        return { doc: doc };
+      });
+      var css = [], files = [];
+      for (var fi = 1; fi < flows.length; fi++) {
+        var path = flowPath(fi);
+        if (!path) continue;
+        var data = cleanXml(decodeWith(65001, flows[fi]));
+        if (/\.css$/.test(path)) {
+          data = data.replace(/@font-face\s*\{[^}]*\}/g, '');
+          css.push({ path: path, data: relink(data, 'css') });
+        } else {
+          files.push({ path: path, mime: 'image/svg+xml', bytes: relink(data, 'images'), id: 'flow' + pad(fi) });
+        }
+      }
+      return { parts: parts, css: css, files: files, mobi6: false };
+    }
+
+    /* ---------- 組成 EPUB ---------- */
+    function plainText(html) {
+      return html.replace(/<[^>]*>/g, ' ').replace(/&#(\d+);/g, function (_, n) { return String.fromCharCode(+n); })
+        .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
+    }
+    function labelOf(html, idx) {
+      var m = html.match(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/i), t = m ? plainText(m[1]) : '';
+      if (!t) {
+        var body = html.indexOf('<body') >= 0 ? html.substring(html.indexOf('<body')) : html;
+        t = plainText(body).substring(0, 30);
+      }
+      if (!t) t = idx === 0 ? '封面' : '第 ' + (idx + 1) + ' 節';
+      return t.length > 80 ? t.substring(0, 80) : t;
+    }
+    function wrapDoc(title, body, lang) {
+      return '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" "http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">\n' +
+        '<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="' + xmlEsc(lang) + '">\n<head>\n<title>' + xmlEsc(title) +
+        '</title>\n<link rel="stylesheet" type="text/css" href="css/style.css"/>\n</head>\n<body>\n' + body + '\n</body>\n</html>\n';
+    }
+
+    async function convert(u8, fileName, outType) {
+      var pdb = parsePdb(u8), r0 = pdb.rec(0), h = parseHeader(r0);
+      if (h.encryption !== 0) throw fail('這個檔案有 DRM 加密（常見於購買的 Kindle 書），無法轉換。');
+      if (h.compression !== 1 && h.compression !== 2) throw fail('這個檔案使用的壓縮方式（HUFF/CDIC）目前不支援。');
+      var text = readText(pdb, h), meta = parseExth(r0, h), imgs = collectImages(pdb, h.firstImage);
+      var book = h.version >= 8 ? kf8(pdb, h, text, imgs) : mobi6(h, text, imgs);
+
+      var title = meta.title;
+      if (!title && h.nameLen > 0 && h.nameLen < 1000 && h.nameOff + h.nameLen <= r0.length) title = decodeWith(h.encoding, r0.subarray(h.nameOff, h.nameOff + h.nameLen));
+      if (!title) title = String(fileName || 'book').replace(/\.[^.]+$/, '');
+
+      var sample = '';
+      for (var q = 0; q < book.parts.length && sample.length < 3000; q++) sample += plainText(book.parts[q].body || book.parts[q].doc || '').substring(0, 1000);
+      var cjk = (sample.match(/[㐀-鿿]/g) || []).length;
+      var lang = meta.lang || (sample.length && cjk / sample.length > 0.1 ? 'zh' : 'en');
+
+      var parts = book.parts.map(function (p, i) {
+        var html = p.body !== undefined ? p.body : p.doc;
+        var label = labelOf(html, i);
+        return { path: 'part' + pad(i + 1) + '.xhtml', xhtml: p.body !== undefined ? wrapDoc(label, p.body, lang) : p.doc, label: label };
+      });
+      var images = [];
+      Object.keys(imgs).forEach(function (k) {
+        var im = imgs[k];
+        images.push({ path: imgPath(+k, im.ext), mime: im.mime, bytes: im.bytes, id: 'img' + pad(+k + 1) });
+      });
+      book.files.forEach(function (f) { images.push(f); });
+      var coverId = (meta.cover !== null && imgs[meta.cover]) ? 'img' + pad(meta.cover + 1) : null;
+      return buildEpub({ title: title, meta: meta, lang: lang, parts: parts, css: book.css, images: images, coverId: coverId, type: outType || 'blob' });
+    }
+
+    async function buildEpub(o) {
+      var zip = new JSZipLib(), NF = { createFolders: false }, man = [], spine = [], nav = [];
+      zip.file('mimetype', 'application/epub+zip', { compression: 'STORE', createFolders: false });
+      zip.file('META-INF/container.xml', '<?xml version="1.0"?>\n<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">\n  <rootfiles>\n    <rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/>\n  </rootfiles>\n</container>\n', NF);
+      man.push('<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>');
+      o.css.forEach(function (c, i) {
+        zip.file('OEBPS/' + c.path, c.data, NF);
+        man.push('<item id="css' + (i + 1) + '" href="' + c.path + '" media-type="text/css"/>');
+      });
+      o.images.forEach(function (im) {
+        zip.file('OEBPS/' + im.path, im.bytes, NF);
+        man.push('<item id="' + im.id + '" href="' + im.path + '" media-type="' + im.mime + '"/>');
+      });
+      var useHeadingsOnly = o.parts.some(function (p) { return false; });
+      o.parts.forEach(function (p, i) {
+        var id = 'p' + pad(i + 1);
+        zip.file('OEBPS/' + p.path, p.xhtml, NF);
+        man.push('<item id="' + id + '" href="' + p.path + '" media-type="application/xhtml+xml"/>');
+        spine.push('<itemref idref="' + id + '"/>');
+        nav.push('<navPoint id="n' + (i + 1) + '" playOrder="' + (i + 1) + '"><navLabel><text>' + xmlEsc(p.label) + '</text></navLabel><content src="' + p.path + '"/></navPoint>');
+      });
+      var uid = 'urn:uuid:' + 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) { var r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16); });
+      var md = ['<dc:title>' + xmlEsc(o.title) + '</dc:title>'];
+      o.meta.authors.forEach(function (a) { md.push('<dc:creator opf:role="aut">' + xmlEsc(a) + '</dc:creator>'); });
+      md.push('<dc:language>' + xmlEsc(o.lang) + '</dc:language>');
+      md.push('<dc:identifier id="bookid">' + uid + '</dc:identifier>');
+      if (o.meta.publisher) md.push('<dc:publisher>' + xmlEsc(o.meta.publisher) + '</dc:publisher>');
+      if (o.meta.description) md.push('<dc:description>' + xmlEsc(o.meta.description) + '</dc:description>');
+      o.meta.subjects.forEach(function (s) { md.push('<dc:subject>' + xmlEsc(s) + '</dc:subject>'); });
+      if (o.coverId) md.push('<meta name="cover" content="' + o.coverId + '"/>');
+      zip.file('OEBPS/content.opf', '<?xml version="1.0" encoding="UTF-8"?>\n<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="bookid" version="2.0">\n<metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">\n' +
+        md.join('\n') + '\n</metadata>\n<manifest>\n' + man.join('\n') + '\n</manifest>\n<spine toc="ncx">\n' + spine.join('\n') + '\n</spine>\n</package>\n', NF);
+      zip.file('OEBPS/toc.ncx', '<?xml version="1.0" encoding="UTF-8"?>\n<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">\n<head>\n<meta name="dtb:uid" content="' + uid + '"/>\n<meta name="dtb:depth" content="1"/>\n<meta name="dtb:totalPageCount" content="0"/>\n<meta name="dtb:maxPageNumber" content="0"/>\n</head>\n<docTitle><text>' + xmlEsc(o.title) + '</text></docTitle>\n<navMap>\n' + nav.join('\n') + '\n</navMap>\n</ncx>\n', NF);
+      return zip.generateAsync({ type: o.type, mimeType: 'application/epub+zip', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+    }
+
+    return { convert: convert, _t: { palmDecompress: palmDecompress, toXhtml: toXhtml, trailSize: trailSize } };
+  }
 
   /* ---------- 工具函式 ---------- */
   function fmt(n) {
@@ -428,12 +1018,23 @@ input[type=file] { font: 400 13px var(--f-body); color: var(--muted); max-width:
   /* ---------- 載入檔案 ---------- */
   async function loadFile(f) {
     if (!f) return;
-    if (!/\.epub$/i.test(f.name)) { say('請選擇副檔名為 .epub 的檔案。', 'err'); return; }
+    var isKindle = /\.(mobi|azw3?|prc)$/i.test(f.name);
+    if (!isKindle && !/\.epub$/i.test(f.name)) { say('請選擇 .epub、.mobi 或 .azw 檔案。', 'err'); return; }
     if (typeof JSZip === 'undefined') { say('壓縮元件沒有載入成功，請重新整理頁面。', 'err'); return; }
-    say('讀取中…');
+    say(isKindle ? '轉換成 EPUB 中…' : '讀取中…');
     $('saveBtn').hidden = true;
+    $('rawBtn').hidden = true;
     resultBlob = null;
+    convertedBlob = null;
     try {
+      if (isKindle) {
+        var kBase = f.name.replace(/\.[^.]+$/, '');
+        var kBuf = new Uint8Array(await f.arrayBuffer());
+        var kBlob = await MobiConverter(JSZip).convert(kBuf, f.name, 'blob');
+        convertedBlob = kBlob;
+        convertedName = kBase + '.epub';
+        f = new File([kBlob], convertedName, { type: 'application/epub+zip' });
+      }
       var z = await JSZip.loadAsync(f);
       var info = await readOpf(z);
       file = f;
@@ -458,11 +1059,16 @@ input[type=file] { font: 400 13px var(--f-body); color: var(--muted); max-width:
         $('noCover').hidden = false;
       }
       $('goBtn').disabled = false;
-      say('已讀取。調整右邊的設定後，按「輸出 EPUB」。');
+      if (isKindle) {
+        $('rawBtn').hidden = false;
+        say('已把 ' + (f.name.replace(/\.epub$/, '')) + ' 轉成 EPUB。可以直接儲存，或調整右邊設定後按「輸出 EPUB」。', 'ok');
+      } else {
+        say('已讀取。調整右邊的設定後，按「輸出 EPUB」。');
+      }
     } catch (e) {
       file = null;
       $('goBtn').disabled = true;
-      say('讀取失敗：' + (e && e.message ? e.message : e), 'err');
+      say((isKindle ? '轉換失敗：' : '讀取失敗：') + (e && e.message ? e.message : e), 'err');
     }
   }
 
@@ -686,6 +1292,12 @@ input[type=file] { font: 400 13px var(--f-body); color: var(--muted); max-width:
   slot.addEventListener('drop', function (e) { loadFile(e.dataTransfer.files[0]); });
 
   $('goBtn').addEventListener('click', exportEpub);
+  $('rawBtn').addEventListener('click', function () {
+    if (!convertedBlob) return;
+    resultBlob = convertedBlob;
+    outName = convertedName;
+    saveResult();
+  });
   $('saveBtn').addEventListener('click', saveResult);
 
   ['s2t', 'quote', 'full', 'font', 'size', 'lh', 'indent'].forEach(function (id) {
